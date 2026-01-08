@@ -1,43 +1,23 @@
-#libraries
+# -----------------------------
+# Libraries
+# -----------------------------
 library(jsonlite)
-library(tidyverse)
-library(tibble)
+library(readr)
+library(dplyr)
+library(purrr)
 library(signal)
+library(tibble)
 
-
-
-
-#file picking & reading
-pick_one <- function(raw_dir, pattern, corrected_dir = NULL) {
-  # Prefer corrected if provided and file exists
-  if (!is.null(corrected_dir) && dir.exists(corrected_dir)) {
-    hits_c <- list.files(corrected_dir, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
-    if (length(hits_c) > 0) return(hits_c[1])
-  }
-  hits_r <- list.files(raw_dir, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
-  if (length(hits_r) > 0) return(hits_r[1])
-  
-  stop(sprintf("Missing file with pattern '%s' in '%s'%s",
-               pattern, raw_dir,
-               if (!is.null(corrected_dir)) paste0(" or '", corrected_dir, "'") else ""))
+# -----------------------------
+# 1) Helper: pick first matching file in a folder
+# -----------------------------
+pick_file <- function(dir, pattern) {
+  list.files(dir, pattern = pattern, full.names = TRUE, ignore.case = TRUE)[1]
 }
 
-#Helper: file with corrected timestamp
-pick_one2 <- function(primary_dir, pattern, override_dir = NULL) {
-  # if override_dir is given, prefer that folder
-  if (!is.null(override_dir) && dir.exists(override_dir)) {
-    hits_o <- list.files(override_dir, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
-    if (length(hits_o) > 0) return(hits_o[1])
-  }
-  
-  hits_p <- list.files(primary_dir, pattern = pattern, full.names = TRUE, ignore.case = TRUE)
-  if (length(hits_p) > 0) return(hits_p[1])
-  
-  stop(sprintf("Missing file pattern '%s' in '%s'%s",
-               pattern, primary_dir,
-               if (!is.null(override_dir)) paste0(" or override '", override_dir, "'") else ""))
-}
-
+# -----------------------------
+# 2) Read timemap + markers
+# -----------------------------
 read_timemap <- function(path) {
   tm <- read_csv(path, show_col_types = FALSE)
   names(tm) <- trimws(names(tm))
@@ -49,10 +29,9 @@ read_timemap <- function(path) {
 
 read_markers <- function(path) {
   mk <- read_csv(path, col_names = FALSE, show_col_types = FALSE)
-  # col1 = time (s), col2 = name
-  names_raw <- trimws(mk$X2)
   
-  # make names unique with suffix counting like Python logic
+  # make marker names unique: A, A2, A3, ...
+  names_raw <- trimws(mk$X2)
   counts <- list()
   names_new <- character(length(names_raw))
   for (i in seq_along(names_raw)) {
@@ -68,84 +47,70 @@ read_markers <- function(path) {
   
   list(
     name = names_new,
-    time = mk$X1 * 1000 # s -> ms
+    time = mk$X1 * 1000  # s -> ms
   )
 }
-#---------
-# read json and rebuild signal
+
+# -----------------------------
+# 3) Read JSON samples
+# -----------------------------
 read_data_json <- function(path) {
-  j <- jsonlite::fromJSON(path, simplifyVector = FALSE)
-  
+  j <- fromJSON(path, simplifyVector = FALSE)
   samples <- j$Samples
-  # If the key doesn't exist OR it's empty -> return NULL
-  if (is.null(samples) || length(samples) == 0) {
-    return(NULL)
-  }
-  
-  # keep only those with MeasIMU9
-  meas <- purrr::keep(samples, ~ !is.null(.x$MeasIMU9))
-  if (length(meas) == 0) return(NULL)
-  
-  meas <- purrr::map(meas, "MeasIMU9")
-  
-  out <- purrr::map(meas, function(m) {
-    if (is.null(m$Timestamp) || is.null(m$ArrayAcc)) return(NULL)
-    list(Timestamp = m$Timestamp, ArrayAcc = m$ArrayAcc)
-  }) |> purrr::compact()
-  
-  if (length(out) == 0) return(NULL)
-  
-  out
+  meas <- keep(samples, ~ !is.null(.x$MeasIMU9)) |> map("MeasIMU9")
+  map(meas, ~ list(Timestamp = .x$Timestamp, ArrayAcc = .x$ArrayAcc))
 }
 
+# -----------------------------
+# 4) Filtering + signal creation (fast)
+# -----------------------------
 filt_norm_signal <- function(x, fs) {
   nyq <- 0.5 * fs
-  
-  # high-pass 0.5 Hz, order 4
-  hp <- signal::butter(4, 0.5 / nyq, type = "high")
-  x  <- signal::filtfilt(hp, x)
-  
-  # low-pass 10 Hz, order 4
-  lp <- signal::butter(4, 10 / nyq, type = "low")
-  x  <- signal::filtfilt(lp, x)
-  
+  x <- filtfilt(butter(4, 0.5 / nyq, type = "high"), x)  # remove gravity
+  x <- filtfilt(butter(4, 10 / nyq,  type = "low"),  x)  # remove noise
   x
 }
 
 create_signal <- function(data, fs = 208, n_samples = 8) {
-  period <- 1000 / fs # ms
-  x <- numeric(0); y <- numeric(0); z <- numeric(0)
-  timepoints <- numeric(0)
+  period <- 1000 / fs
+  n_total <- length(data) * n_samples
   
+  x <- numeric(n_total); y <- numeric(n_total); z <- numeric(n_total)
+  t <- numeric(n_total)
+  
+  idx <- 1L
   for (dp in data) {
     ts0 <- dp$Timestamp
     samples <- dp$ArrayAcc
-    
     n <- length(samples)
-    if (n != n_samples) {
-      message(n, " samples (expected ", n_samples, ") in packet at ts=", ts0, " (no interpolation implemented)")
-    }
     
-    for (s in samples) {
-      x <- c(x, s$x)
-      y <- c(y, s$y)
-      z <- c(z, s$z)
+    for (i in seq_len(n)) {
+      s <- samples[[i]]
+      x[idx] <- s$x
+      y[idx] <- s$y
+      z[idx] <- s$z
+      t[idx] <- ts0 + (i - 1) * period
+      idx <- idx + 1L
     }
-    timepoints <- c(timepoints, ts0 + (0:(n - 1)) * period)
   }
   
-  intensity_unfiltered <- sqrt(x^2 + y^2 + z^2)
+  if (idx <= n_total) {
+    keep <- seq_len(idx - 1L)
+    x <- x[keep]; y <- y[keep]; z <- z[keep]; t <- t[keep]
+  }
+  
+  unfiltered <- sqrt(x^2 + y^2 + z^2)
   
   fx <- filt_norm_signal(x, fs)
   fy <- filt_norm_signal(y, fs)
   fz <- filt_norm_signal(z, fs)
   
-  intensity_filtered <- sqrt(fx^2 + fy^2 + fz^2)
-  
   list(
-    intensities = intensity_filtered,
-    unfiltered  = intensity_unfiltered,
-    timestamps  = timepoints
+    t = t,
+    x = x, y = y, z = z,
+    fx = fx, fy = fy, fz = fz,
+    unfiltered = unfiltered,
+    intensity = sqrt(fx^2 + fy^2 + fz^2)
   )
 }
 
@@ -153,140 +118,92 @@ local2utc <- function(timestamp_ms, local_ms, utc_us) {
   timestamp_ms - local_ms + (utc_us / 1000)
 }
 
-#-------------------
-# load one session and override markers if provided
-load_acceleration_session <- function(raw_root, subject_rel_path,
-                                      corrected_timemap_root = NULL,
-                                      fs = 208, n_samples = 8) {
+# -----------------------------
+# 5) Load ONE session folder
+#    - JSON + timemap always from raw
+#    - marker: use corrected if available, else raw
+# -----------------------------
+load_acc_session <- function(raw_root, subject_rel_path,
+                             corrected_marker_root = NULL,
+                             fs = 208, n_samples = 8) {
+  
   raw_dir <- file.path(raw_root, subject_rel_path)
+  corr_dir <- if (!is.null(corrected_marker_root)) file.path(corrected_marker_root, subject_rel_path) else NULL
   
-  # corrected timemap leaf folder (same relative path) – optional
-  corr_tm_dir <- if (!is.null(corrected_timemap_root)) {
-    file.path(corrected_timemap_root, subject_rel_path)
-  } else NULL
+  json_file   <- pick_file(raw_dir, "\\.json$")
+  timemap_file <- pick_file(raw_dir, "timemap.*\\.txt$")
   
-  # JSON + marker always from raw
-  json_file   <- pick_one2(raw_dir, "\\.json$")
-  marker_file <- pick_one2(raw_dir, "marker.*\\.txt$")
-  
-  # timemap: prefer corrected folder, else raw
-  timemap_file <- pick_one2(raw_dir, "timemap.*\\.txt$", override_dir = corr_tm_dir)
+  marker_file <- if (!is.null(corr_dir) && dir.exists(corr_dir)) {
+    pick_file(corr_dir, "marker.*\\.txt$")
+  } else {
+    pick_file(raw_dir, "marker.*\\.txt$")
+  }
   
   data <- read_data_json(json_file)
-  if (is.null(data)) {
-    stop("Empty/invalid JSON samples in: ", json_file)
-  }
-  tm     <- read_timemap(timemap_file)
+  tm <- read_timemap(timemap_file)
   events <- read_markers(marker_file)
   
   sig <- create_signal(data, fs = fs, n_samples = n_samples)
-  time_utc <- local2utc(sig$timestamps, local_ms = tm$local, utc_us = tm$utc)
+  time_utc <- local2utc(sig$t, tm$local, tm$utc)
   
-  df <- tibble::tibble(
+  df <- tibble(
     time_utc_ms = time_utc,
-    timestamp_ms = sig$timestamps,
-    intensity = sig$intensities,
+    timestamp_ms = sig$t,
+    x = sig$x, y = sig$y, z = sig$z,
+    fx = sig$fx, fy = sig$fy, fz = sig$fz,
+    intensity = sig$intensity,
     intensity_unfiltered = sig$unfiltered,
-    subject_path = subject_rel_path
+    subject_path = factor(subject_rel_path)
   )
   
-  list(
-    data = df,
-    events = events,
-    timemap = tm,
-    files = list(json = json_file, timemap = timemap_file, marker = marker_file)
-  )
+  list(data = df, events = events)
 }
 
+# -----------------------------
+# 6) Batch load ONLY the folders in `to_load`
+# -----------------------------
+#time keeping
+t0 <- Sys.time()
 
-#example
-# res <- load_acceleration_session(
-#   raw_root = "data",
-#   subject_rel_path = file.path("April 1", "Session 1", "1990"),
-#   corrected_timemap_root = file.path("data", "_Corrected Timestamp Files")
-# )
-# 
-# res$data
-# res$events
-# res$files
 
-# find all session folders
-find_session_leaf_folders <- function(raw_root) {
-  # all folders under raw_root (including raw_root)
-  dirs <- c(raw_root, list.dirs(raw_root, recursive = TRUE, full.names = TRUE))
-  
-  keep <- vapply(dirs, function(d) {
-    if (!dir.exists(d)) return(FALSE)
-    
-    files <- list.files(d, full.names = FALSE, ignore.case = TRUE)
-    
-    has_json   <- any(grepl("\\.json$", files, ignore.case = TRUE))
-    has_marker <- any(grepl("marker.*\\.txt$", files, ignore.case = TRUE))
-    has_tm     <- any(grepl("timemap.*\\.txt$", files, ignore.case = TRUE))
-    
-    has_json && has_marker && has_tm
-  }, logical(1))
-  
-  dirs[keep]
-}
-# batch load data
-load_all_sessions <- function(raw_root = "data",
-                              corrected_timemap_root = file.path("data", "_Corrected Timestamp Files"),
+load_from_to_load <- function(to_load,
+                              raw_root = "data",
+                              corrected_marker_root = file.path("data", "_Corrected Marker Files"),
                               fs = 208, n_samples = 8) {
   
-  leaf_dirs <- find_session_leaf_folders(raw_root)
-  raw_root_norm <- normalizePath(raw_root, winslash = "/", mustWork = TRUE)
+  out <- vector("list", length(to_load))
   
-  rel_paths <- vapply(leaf_dirs, function(d) {
-    d_norm <- normalizePath(d, winslash = "/", mustWork = TRUE)
-    sub(paste0("^", raw_root_norm, "/?"), "", d_norm)
-  }, character(1))
-  
-  all_data <- list()
-  sessions <- list()
-  
-  errors <- tibble::tibble(
-    subject_path = character(),
-    error = character()
-  )
-  
-  for (i in seq_along(rel_paths)) {
-    p <- rel_paths[i]
-    message(sprintf("[%d/%d] Loading: %s", i, length(rel_paths), p))
+  for (i in seq_along(to_load)) {
+    p <- to_load[i]
+    message(sprintf("[%d/%d] %s", i, length(to_load), p))
     
-    out <- tryCatch(
-      load_acceleration_session(
-        raw_root = raw_root,
-        subject_rel_path = p,
-        corrected_timemap_root = corrected_timemap_root,
-        fs = fs, n_samples = n_samples
-      ),
-      error = function(e) e
+    out[[i]] <- load_acc_session(
+      raw_root = raw_root,
+      subject_rel_path = p,
+      corrected_marker_root = corrected_marker_root,
+      fs = fs,
+      n_samples = n_samples
     )
-    
-    if (inherits(out, "error")) {
-      errors <- dplyr::add_row(errors, subject_path = p, error = out$message)
-      next
-    }
-    
-    sessions[[p]] <- out
-    all_data[[p]] <- out$data
   }
   
-  list(
-    all_data = dplyr::bind_rows(all_data),
-    sessions = sessions,
-    errors = errors
-  )
+  acc_data <- bind_rows(lapply(out, `[[`, "data"))
+  acc_data$subject_path <- factor(acc_data$subject_path)
+  
+  list(all_data = acc_data, sessions = out)
 }
 
+#time keeping
+Sys.time() - t0
 
-#run it on project
-all <- load_all_sessions(raw_root = "data",
-                         corrected_timemap_root = file.path("data", "_Corrected Timestamp Files"))
-
+# -----------------------------
+# Example
+# -----------------------------
+to_load <- readRDS("data/to_load_subject_paths.rds")
+all <- load_from_to_load(to_load)
 all$all_data
-all$errors
 
-
+# -----------------------------
+# save data
+# -----------------------------
+saveRDS(all$all_data, "data/acc_all_data.rds")
 
