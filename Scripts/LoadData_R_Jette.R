@@ -98,7 +98,6 @@ read_data_json <- function(path) {
   out
 }
 
-
 filt_norm_signal <- function(x, fs) {
   nyq <- 0.5 * fs
   
@@ -173,7 +172,10 @@ load_acceleration_session <- function(raw_root, subject_rel_path,
   # timemap: prefer corrected folder, else raw
   timemap_file <- pick_one2(raw_dir, "timemap.*\\.txt$", override_dir = corr_tm_dir)
   
-  data   <- read_data_json(json_file)
+  data <- read_data_json(json_file)
+  if (is.null(data)) {
+    stop("Empty/invalid JSON samples in: ", json_file)
+  }
   tm     <- read_timemap(timemap_file)
   events <- read_markers(marker_file)
   
@@ -198,14 +200,93 @@ load_acceleration_session <- function(raw_root, subject_rel_path,
 
 
 #example
-res <- load_acceleration_session(
-  raw_root = "data",
-  subject_rel_path = file.path("April 1", "Session 1", "1990"),
-  corrected_timemap_root = file.path("data", "_Corrected Timestamp Files")
-)
+# res <- load_acceleration_session(
+#   raw_root = "data",
+#   subject_rel_path = file.path("April 1", "Session 1", "1990"),
+#   corrected_timemap_root = file.path("data", "_Corrected Timestamp Files")
+# )
+# 
+# res$data
+# res$events
+# res$files
 
-res$data
-res$events
-res$files
+# find all session folders
+find_session_leaf_folders <- function(raw_root) {
+  # all folders under raw_root (including raw_root)
+  dirs <- c(raw_root, list.dirs(raw_root, recursive = TRUE, full.names = TRUE))
+  
+  keep <- vapply(dirs, function(d) {
+    if (!dir.exists(d)) return(FALSE)
+    
+    files <- list.files(d, full.names = FALSE, ignore.case = TRUE)
+    
+    has_json   <- any(grepl("\\.json$", files, ignore.case = TRUE))
+    has_marker <- any(grepl("marker.*\\.txt$", files, ignore.case = TRUE))
+    has_tm     <- any(grepl("timemap.*\\.txt$", files, ignore.case = TRUE))
+    
+    has_json && has_marker && has_tm
+  }, logical(1))
+  
+  dirs[keep]
+}
+# batch load data
+load_all_sessions <- function(raw_root = "data",
+                              corrected_timemap_root = file.path("data", "_Corrected Timestamp Files"),
+                              fs = 208, n_samples = 8) {
+  
+  leaf_dirs <- find_session_leaf_folders(raw_root)
+  raw_root_norm <- normalizePath(raw_root, winslash = "/", mustWork = TRUE)
+  
+  rel_paths <- vapply(leaf_dirs, function(d) {
+    d_norm <- normalizePath(d, winslash = "/", mustWork = TRUE)
+    sub(paste0("^", raw_root_norm, "/?"), "", d_norm)
+  }, character(1))
+  
+  all_data <- list()
+  sessions <- list()
+  
+  errors <- tibble::tibble(
+    subject_path = character(),
+    error = character()
+  )
+  
+  for (i in seq_along(rel_paths)) {
+    p <- rel_paths[i]
+    message(sprintf("[%d/%d] Loading: %s", i, length(rel_paths), p))
+    
+    out <- tryCatch(
+      load_acceleration_session(
+        raw_root = raw_root,
+        subject_rel_path = p,
+        corrected_timemap_root = corrected_timemap_root,
+        fs = fs, n_samples = n_samples
+      ),
+      error = function(e) e
+    )
+    
+    if (inherits(out, "error")) {
+      errors <- dplyr::add_row(errors, subject_path = p, error = out$message)
+      next
+    }
+    
+    sessions[[p]] <- out
+    all_data[[p]] <- out$data
+  }
+  
+  list(
+    all_data = dplyr::bind_rows(all_data),
+    sessions = sessions,
+    errors = errors
+  )
+}
 
- 
+
+#run it on project
+all <- load_all_sessions(raw_root = "data",
+                         corrected_timemap_root = file.path("data", "_Corrected Timestamp Files"))
+
+all$all_data
+all$errors
+
+
+
