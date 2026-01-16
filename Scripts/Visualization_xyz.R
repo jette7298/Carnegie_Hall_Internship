@@ -101,3 +101,40 @@ plot_ly(
   ) %>%
   plotly::animation_button(x = 0.05, y = 0.05) %>%
   plotly::animation_slider(currentvalue = list(prefix = "Frame: "))
+
+
+#make it faster
+one <- one |>
+  mutate(t = (timestamp_ms - first(timestamp_ms)) / 1000) |>
+  filter(t <= 10)
+
+# (B) aggressive fast-forward
+step <- 200   # try 200, 500, 1000 depending on sampling rate
+one_ff <- one |>
+  slice(seq(1, n(), by = step)) |>
+  mutate(frame = row_number())
+
+# (C) fixed axis limits (prevents expensive re-scaling)
+xr <- range(one_ff$x, na.rm = TRUE)
+yr <- range(one_ff$y, na.rm = TRUE)
+zr <- range(one_ff$z, na.rm = TRUE)
+
+plot_ly(
+  one_ff,
+  x = ~x, y = ~y, z = ~z,
+  frame = ~frame,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 4)
+) %>%
+  plotly::layout(
+    title = "Fast 3D moving dot (downsampled)",
+    scene = list(
+      xaxis = list(title = "x", range = xr),
+      yaxis = list(title = "y", range = yr),
+      zaxis = list(title = "z", range = zr)
+    )
+  ) %>%
+  plotly::animation_opts(frame = 10, transition = 0, redraw = TRUE)
+
+  
