@@ -1,3 +1,6 @@
+# The results of this code (the table full_data_synchrony.rds) can be found in 
+# the one drive for this project.
+
 # 0. Set up workspace
 rm(list = ls())
 library(dplyr)
