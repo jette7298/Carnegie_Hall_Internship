@@ -73,24 +73,46 @@ list_all <- list(playtime_april_1_s1, playtime_april_1_s2, playtime_april_3_s1,
                  concert_april_4_s2, concert_nov_4_s1, concert_nov_4_s2,
                  concert_nov_6_s1, concert_nov_6_s2, concert_nov_8_s1, concert_nov_8_s2)
 
+# Shorten to reduce cause the added columns caused issues
+list_all <- lapply(list_all, function(x) x[, seq_len(min(15, ncol(x)))])
+
+# Rename columns so that they have the same names across tables
+list_all <- lapply(list_all, function(x) {
+  names(x)[grepl("Date", names(x))] <- "Date"
+  x
+})
+
+list_all <- lapply(list_all, function(x) {
+  names(x)[grepl("Session", names(x))] <- "Session"
+  x
+})
+
 # Find the common columns to combine the files to a data frame
 common_cols <- Reduce(intersect, lapply(list_all, names))
 
-# Create the data frame, while disregarding all columns that aren't shared by all
-# tables
-
+# Create the data frame, while disregarding all columns that aren't shared by all tables
 combined_marker_files <- do.call(
   rbind,
   lapply(list_all, function(df) df[, common_cols, drop = FALSE])
 )
 
 # Reduce the data frame to its most necessary parts to try and reduce RAM issues.
-combined_marker_files <- combined_marker_files[, 1:5] %>%
+combined_marker_files <- combined_marker_files[, 1:8] %>%
   filter(Marker == "PLAYTIME_STOP" | Marker == "PLAYTIME_START" | Marker == "CONCERT_STOP" | Marker == "CONCERT_START")
+
+# Rename the entries in the Session column to better fit the entries in the overview_valid_data table
+combined_marker_files <- combined_marker_files %>%
+  mutate(Session = recode(Session,
+                          "1" = "Session 1",
+                          "2" = "Session 2"))
 
 # Check that the data frame looks as expected
 names(combined_marker_files)
 head(combined_marker_files)
+
+# Make the data frames data tables
+setDT(combined_marker_files)
+setDT(overview_valid_data)
 
 # join overview and marker tables because the marker table does not include 
 # information like sensor, id, and session. That info is necessary to later
@@ -98,11 +120,14 @@ head(combined_marker_files)
 overview_valid_data <- overview_valid_data %>%
   left_join(
     combined_marker_files,
-    by = c("ParticipantID (in survey)" = "ID", 
-           "Sensor (last 4 digits)" = "Sensor", 
-           "Participant" = "P/C"))
+    by = c("Sensor (last 4 digits)" = "Sensor", 
+           "Time/Session" = "Session",
+           "Date" = "Date"))
 
-# I renamed the column "ParticipantID (in survey)" because names in camel case
+# Remove rows with NAs where the markers are likely missing
+overview_valid_data <- na.omit(overview_valid_data)
+
+# I renamed the column "ParticipantID (in survey)" to dyad_id because names in camel case
 # are easier to use in R
 overview_valid_data <- overview_valid_data %>%
   rename(dyad_id = "ParticipantID (in survey)",
@@ -158,18 +183,19 @@ overview_valid_data <- overview_valid_data %>%
 
 # 3. remove unnecessary data outside of the start and stop markers
 
-# We use tidyr to get start/stop into columns, then convert to data.table
 markers_dt <- overview_valid_data %>%
-  # Convert Unix seconds to POSIXct
+  # Convert seconds to POSIXct
   mutate(timestamp_clean = as.POSIXct(`Unix Timestamp`, origin = "1970-01-01", tz = "UTC")) %>%
   select(date_norm, session, sensor, Marker, timestamp_clean) %>%
   pivot_wider(names_from = Marker, values_from = timestamp_clean) %>%
+  # widen the table to have all start times and all stop times in one column, respectively
   mutate(
     start_time = coalesce(PLAYTIME_START, CONCERT_START),
     stop_time  = coalesce(PLAYTIME_STOP, CONCERT_STOP)
   ) %>%
   select(date_norm, session, sensor, start_time, stop_time) %>%
   as.data.table()
+
 
 # Prepare the Observation (IMU) Table by converting it to a more RAM-friendly option
 setDT(full_data_IMU)
@@ -184,19 +210,13 @@ full_data_IMU[, obs_time_clean := as.POSIXct(time_utc_ms / 1000,
 cleaned_data <- full_data_IMU[markers_dt, 
                               on = .(date_norm, session, sensor, 
                                      obs_time_clean >= start_time, 
-                                     obs_time_clean <= stop_time), 
-                              nomatch = NULL]
-
-# Clean up names
-setnames(cleaned_data, 
-         old = c("obs_time_clean", "obs_time_clean.1"), 
-         new = c("start_time", "stop_time"))
+                                     obs_time_clean <= stop_time)]
 
 # only keep necessary columns
 # feel free to adapt if you feel like more columns are necessary and or interesting
 # Again an attempt to reduce the data size
 cleaned_data <- cleaned_data %>%
-  select("time_utc_ms", "timestamp_ms", "fx", "fy", "fz", "intensity", "session", "sensor", "date_norm",)
+  select("time_utc_ms", "timestamp_ms", "fx", "fy", "fz", "session", "sensor", "date_norm", "subject_path")
 
 # Preview the result
 head(cleaned_data)
@@ -207,7 +227,7 @@ names(cleaned_data)
 
 # Only select the interesting columns
 overview_valid_data <- overview_valid_data %>%
-  select("dyad_id", "participant_type", "Condition", "File name of Cleaned ECG data",
+  select("dyad_id", "participant_type", "Condition.x", "File name of Cleaned ECG data",
          "Reviewer", "session", "sensor", "date_norm")
 
 # Making sure no rows exist twice after all this work on the tables
@@ -221,8 +241,13 @@ setDT(overview_valid_data)
 setkey(cleaned_data, date_norm, sensor, session)
 setkey(overview_valid_data, date_norm, sensor, session)
 
+# remove everything that is unnecessary for this step 
+rm(list = setdiff(ls(), c("overview_valid_data", "cleaned_data")))
+
 # Left join (cleaned_data keeps all rows)
 result <- overview_valid_data[cleaned_data]
+
+unique(result$participant_type)
 
 saveRDS(result, "full_dataset_synchrony.rds")
 
