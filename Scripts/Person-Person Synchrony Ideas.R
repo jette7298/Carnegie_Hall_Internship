@@ -1,3 +1,7 @@
+# The results of this code can be found in the One Drive folder
+# for the BDS project under the names "sync_results_parent_child_idea_1.rds",
+"sync_results_parent_child_idea_2.rds", and "sync_results_parent_child_idea_3.rds"
+
 # 0. Set up workspace
 rm(list = ls())
 library(tidyverse)
