@@ -1,0 +1,636 @@
+---
+title: "Load_Data_Complete"
+output: html_document
+---
+
+This document serves as a documentation of the complete data loading process. Since the dataset is fairly big, a database backend is used to store and manipulate the data. The following steps outline the data loading procedure.
+
+0. **Load Required Libraries**: The necessary R libraries for database interaction and data manipulation are loaded.
+```{r, warning=FALSE, message=FALSE}}
+# Core tidyverse (includes dplyr, readr, tibble, purrr, stringr)
+library(tidyverse)
+
+# File formats
+library(readxl)
+library(jsonlite)
+
+# Signal processing
+library(signal)
+
+# Database / DuckDB
+library(DBI)
+library(duckdb)
+library(dbplyr)
+
+``` 
+
+1. The first step was to identify the valid session folders containing complete recordings. We knew, that not all observations are a part of a complete diad. As it was our main goal to investigate synchrony where complete diads are crucial, we filtered for only valid diads. We also inclduded performers data, as also the synchrony to them shoud be investigated. 
+The Masterdata-file shared with us did not directly containted this information, but the file "ECG Data Overview.xlsx" provided us with the necessary details to filter for valid sessions. Now follows the code where a dataframe is created containing only the valid sessions for diads.
+
+```{r}
+# read filter data
+valid <- read_excel("../data/ECG Data Overview.xlsx", sheet = 1)
+diads <- read_excel("../data/ECG Data Overview.xlsx", sheet = 3)
+masterdata <- read_csv("../data/Masterdata_ECG_NoSignalCorrection.csv")
+
+## Preparing diads dataframe
+#for diads drop colums 4 to 7, as they are not needed
+diads <- diads %>% select(-c(4:7))
+#make first row columnn name
+colnames(diads) <- diads[1, ]
+#drop first row
+diads <- diads[-1, ]
+
+
+#now preparing the valid f
+#first the column names
+colnames(valid) <- c(
+  "wave",
+  "participant_id_survey",
+  "date",
+  "time_session",
+  "sensor_last4",
+  "participant",
+  "condition",
+  "ECG_ParticipantID",
+  "correcting_ecg",
+  "reviewer",
+  "comments_markers",
+  "comments_ecg_signal"
+)
+
+# now drop every row that is not in diads
+valid <- valid %>% dplyr::filter(participant_id_survey %in% diads$ID)
+
+# now save that file
+write_csv(valid, "../data/valid_sessions.csv")
+
+```
+
+2. Next, we identified the session folders that contained the necessary files: JSON data files, marker text files, and timemap text files. We created a list of these valid session folders and converted their absolute paths to relative paths for easier handling.
+We include all the paths form the valid sessions as identified earlier, as well as the paths to performers data.
+
+```{r}
+# ------------------------------------------------------------
+# 0) Helper: turn "November4" or "November 4" -> "November 4"
+# (matches your folder naming in `raw_root`)
+# ------------------------------------------------------------
+to_date_folder <- function(x) {
+  sub("(\\D+)(\\d+)$", "\\1 \\2", gsub("\\s+", "", x))
+}
+raw_root <- "../data"
+
+# ------------------------------------------------------------------
+# 2) Find all "leaf" folders that contain one complete recording
+#    (json + marker + timemap)
+# ------------------------------------------------------------------
+find_session_leaf_folders <- function(root) {
+  dirs <- list.dirs(root, recursive = TRUE, full.names = TRUE)
+  
+  dirs[vapply(dirs, function(d) {
+    files <- list.files(d, ignore.case = TRUE)
+    any(grepl("\\.json$", files)) &&
+      any(grepl("marker.*\\.txt$", files)) &&
+      any(grepl("timemap.*\\.txt$", files))
+  }, logical(1))]
+}
+
+leaf_dirs <- find_session_leaf_folders(raw_root)
+
+# ------------------------------------------------------------------
+# 3) Convert absolute paths → relative paths
+#    e.g. "data/April 1/Session 1/1990" → "April 1/Session 1/1990"
+# ------------------------------------------------------------------
+root_norm <- normalizePath(raw_root, winslash = "/")
+
+rel_paths <- sub(
+  paste0("^", root_norm, "/?"),
+  "",
+  normalizePath(leaf_dirs, winslash = "/")
+)
+
+# ------------------------------------------------------------------
+# 4) Build keys from folder structure
+#    "April 1/Session 1/1990" → "April 1|1|1990"
+# ------------------------------------------------------------------
+make_leaf_key <- function(path) {
+  parts <- strsplit(path, "/")[[1]]
+  paste(
+    parts[1],                              # date folder
+    str_extract(parts[2], "\\d+"),         # session number
+    parts[length(parts)],                  # sensor ID
+    sep = "|"
+  )
+}
+
+leaf_key_df <- tibble(
+  subject_rel_path = rel_paths,
+  key = map_chr(rel_paths, make_leaf_key)
+)
+
+# ------------------------------------------------------------
+# 1) Ensure `valid` has a folder-style key: "April 1|1|2236"
+# ------------------------------------------------------------
+valid <- valid %>%
+  mutate(
+    date_folder = paste0(
+      format(as.Date(date), "%B"),
+      " ",
+      as.integer(format(as.Date(date), "%d"))
+    ),
+    session_nr = str_extract(time_session, "\\d+"),
+    sensor_chr = as.character(sensor_last4),
+    valid_key  = paste(date_folder, session_nr, sensor_chr, sep = "|")
+  )
+
+valid_folder_keys <- valid %>%
+  distinct(valid_key) %>%
+  pull(valid_key)
+
+# ------------------------------------------------------------
+# 2) Build performer folder keys from `masterdata`
+#    (same folder key format as above)
+# ------------------------------------------------------------
+performer_folder_keys <- masterdata %>%
+  mutate(
+    date_folder  = to_date_folder(ParticipationDate),
+    session_nr   = str_extract(Session, "\\d+"),
+    sensor_last4 = str_extract(as.character(Sensor), "\\d{4}$"),
+    folder_key   = paste(date_folder, session_nr, sensor_last4, sep = "|")
+  ) %>%
+  dplyr::filter(tolower(ParticipantType) == "performer") %>%
+  distinct(folder_key) %>%
+  pull(folder_key)
+
+# ------------------------------------------------------------
+# 3) Union: keep all valid keys + all performer keys
+# ------------------------------------------------------------
+keys_to_keep <- union(valid_folder_keys, performer_folder_keys)
+
+# ------------------------------------------------------------
+# 4) Filter leaf folders to those keys and save
+# ------------------------------------------------------------
+to_load <- leaf_key_df %>%
+  dplyr::filter(key %in% keys_to_keep) %>%
+  pull(subject_rel_path)
+
+length(to_load)
+saveRDS(to_load, "../data/to_load_subject_paths.rds")
+
+```
+But first, to be able to get the key for this table we have to make a connection to the masterfile 
+
+```{r}
+master_lookup <- masterdata %>%
+  mutate(
+    date_folder = str_replace_all(ParticipationDate, "\\s+", ""),   # e.g., "April1"
+    session_nr  = as.integer(str_extract(Session, "\\d+")),         # "Session1" -> 1
+    sensor_chr  = str_extract(as.character(Sensor), "\\d{4}$"),     # 2236 -> "2236"
+    key         = paste(date_folder, session_nr, sensor_chr, sep = "|")
+  ) %>%
+  distinct(key, ECG_ParticipantID) 
+```
+
+Now there that is done we use this paths to load in the corresponding jason files. This takes about an hours.
+
+
+```{r}
+# ============================================================
+# Load IMU acceleration data for all sessions in `to_load`
+# - JSON + timemap from RAW folder
+# - marker from corrected folder if available, else RAW
+# - NO trimming / windowing (loads full JSON)
+# ============================================================
+
+# -----------------------------
+# Helper: pick first matching file in a folder
+# -----------------------------
+pick_file <- function(dir, pattern) {
+  list.files(dir, pattern = pattern, full.names = TRUE, ignore.case = TRUE)[1]
+}
+
+# -----------------------------
+# Read timemap + markers
+# -----------------------------
+read_timemap <- function(path) {
+  tm <- read_csv(path, show_col_types = FALSE)
+  names(tm) <- trimws(names(tm))
+  list(
+    utc   = tm[["Device UTC (us)"]][1],
+    local = tm[["Device local (ms)"]][1]
+  )
+}
+
+read_markers <- function(path) {
+  mk <- read_csv(path, col_names = FALSE, show_col_types = FALSE)
+
+  # make marker names unique: A, A2, A3, ...
+  names_raw <- trimws(mk$X2)
+  counts <- list()
+  names_new <- character(length(names_raw))
+  for (i in seq_along(names_raw)) {
+    nm <- names_raw[i]
+    if (!is.null(counts[[nm]])) {
+      counts[[nm]] <- counts[[nm]] + 1L
+      names_new[i] <- paste0(nm, counts[[nm]])
+    } else {
+      counts[[nm]] <- 1L
+      names_new[i] <- nm
+    }
+  }
+
+  list(
+    name = names_new,
+    time = mk$X1 * 1000  # seconds -> milliseconds
+  )
+}
+
+# -----------------------------
+# Read JSON samples (full file)
+# -----------------------------
+read_data_json <- function(path) {
+  j <- fromJSON(path, simplifyVector = FALSE)
+  samples <- j$Samples
+  meas <- keep(samples, ~ !is.null(.x$MeasIMU9)) |> map("MeasIMU9")
+  map(meas, ~ list(Timestamp = .x$Timestamp, ArrayAcc = .x$ArrayAcc))
+}
+
+# -----------------------------
+# Filtering + signal creation
+# -----------------------------
+filt_norm_signal <- function(x, fs) {
+  nyq <- 0.5 * fs
+  x <- filtfilt(butter(4, 0.5 / nyq, type = "high"), x)  # remove gravity
+  x <- filtfilt(butter(4, 10 / nyq,  type = "low"),  x)  # remove noise
+  x
+}
+
+create_signal <- function(data, fs = 208, n_samples = 8) {
+  period <- 1000 / fs
+  n_total <- length(data) * n_samples
+
+  x <- numeric(n_total); y <- numeric(n_total); z <- numeric(n_total)
+  t <- numeric(n_total)
+
+  idx <- 1L
+  for (dp in data) {
+    ts0 <- dp$Timestamp
+    samples <- dp$ArrayAcc
+    n <- length(samples)
+
+    for (i in seq_len(n)) {
+      s <- samples[[i]]
+      x[idx] <- s$x
+      y[idx] <- s$y
+      z[idx] <- s$z
+      t[idx] <- ts0 + (i - 1) * period
+      idx <- idx + 1L
+    }
+  }
+
+  if (idx <= n_total) {
+    keep_idx <- seq_len(idx - 1L)
+    x <- x[keep_idx]; y <- y[keep_idx]; z <- z[keep_idx]; t <- t[keep_idx]
+  }
+
+  unfiltered <- sqrt(x^2 + y^2 + z^2)
+
+  fx <- filt_norm_signal(x, fs)
+  fy <- filt_norm_signal(y, fs)
+  fz <- filt_norm_signal(z, fs)
+
+  list(
+    t = t,
+    x = x, y = y, z = z,
+    fx = fx, fy = fy, fz = fz,
+    unfiltered = unfiltered,
+    intensity = sqrt(fx^2 + fy^2 + fz^2)
+  )
+}
+
+# local -> utc (keep as you had it)
+local2utc <- function(timestamp_ms, local_ms, utc_us) {
+  timestamp_ms - local_ms + (utc_us / 1000)
+}
+
+# -----------------------------
+# Load ONE session folder
+# -----------------------------
+load_acc_session <- function(raw_root, subject_rel_path,
+                             corrected_marker_root = NULL,
+                             fs = 208, n_samples = 8) {
+
+  raw_dir <- file.path(raw_root, subject_rel_path)
+  corr_dir <- if (!is.null(corrected_marker_root)) file.path(corrected_marker_root, subject_rel_path) else NULL
+
+  json_file    <- pick_file(raw_dir, "\\.json$")
+  timemap_file <- pick_file(raw_dir, "timemap.*\\.txt$")
+
+  marker_file <- if (!is.null(corr_dir) && dir.exists(corr_dir)) {
+    pick_file(corr_dir, "marker.*\\.txt$")
+  } else {
+    pick_file(raw_dir, "marker.*\\.txt$")
+  }
+
+  # basic guards (prevents cryptic errors)
+  if (is.na(json_file) || is.na(timemap_file) || is.na(marker_file)) {
+    warning(sprintf("[%s] Missing json/timemap/marker file. Skipping.", subject_rel_path), call. = FALSE)
+    return(list(data = tibble(), events = NULL))
+  }
+
+  data   <- read_data_json(json_file)
+  tm     <- read_timemap(timemap_file)
+  events <- read_markers(marker_file)
+
+  sig <- create_signal(data, fs = fs, n_samples = n_samples)
+  time_utc <- local2utc(sig$t, tm$local, tm$utc)
+
+  df <- tibble(
+    time_utc_ms = time_utc,
+    timestamp_ms = sig$t,
+    x = sig$x, y = sig$y, z = sig$z,
+    fx = sig$fx, fy = sig$fy, fz = sig$fz,
+    intensity = sig$intensity,
+    intensity_unfiltered = sig$unfiltered,
+    subject_path = factor(subject_rel_path)
+  )
+
+  list(data = df, events = events)
+}
+
+# -----------------------------
+# Batch load ONLY folders in `to_load`
+# -----------------------------
+load_from_to_load <- function(to_load,
+                              raw_root,
+                              corrected_marker_root,
+                              fs = 208, n_samples = 8) {
+
+  t0 <- Sys.time()
+
+  out <- vector("list", length(to_load))
+
+  for (i in seq_along(to_load)) {
+    p <- to_load[i]
+    message(sprintf("[%d/%d] %s", i, length(to_load), p))
+
+    out[[i]] <- load_acc_session(
+      raw_root = raw_root,
+      subject_rel_path = p,
+      corrected_marker_root = corrected_marker_root,
+      fs = fs,
+      n_samples = n_samples
+    )
+  }
+
+  acc_data <- bind_rows(lapply(out, `[[`, "data"))
+  acc_data <- acc_data %>%
+    mutate(
+  subject_path_chr = as.character(subject_path),
+
+  # "April 1" -> "April1"
+  date_folder = str_replace_all(str_extract(subject_path_chr, "^[^/]+"), "\\s+", ""),
+
+  # extract session number from ".../Session 2/..."
+  session_nr = as.integer(str_extract(str_extract(subject_path_chr, "Session\\s*\\d+"), "\\d+")),
+
+  # extract sensor = last path component (no lookbehind)
+  sensor_chr = str_extract(subject_path_chr, "\\d{4}$"),
+
+  # composite key
+  key = paste(date_folder, session_nr, sensor_chr, sep = "|")
+) %>%
+    left_join(master_lookup, by = "key") %>%
+    select(-subject_path_chr)
+  if (nrow(acc_data) > 0 && "subject_path" %in% names(acc_data)) {
+    acc_data$subject_path <- factor(acc_data$subject_path)
+  }
+
+  message("Total load time: ", round(difftime(Sys.time(), t0, units = "secs"), 1), "s")
+
+  list(all_data = acc_data, sessions = out)
+}
+
+# -----------------------------
+# Run
+# -----------------------------
+to_load <- readRDS("../data/to_load_subject_paths.rds")
+#restriction for trying it out
+# to_load_small <- to_load[1:5]
+# 
+# all_small <- load_from_to_load(
+#   to_load = to_load_small,
+#   raw_root = "../data",
+#   corrected_marker_root = "../data/_Corrected Marker Files"
+# )
+
+
+all <- load_from_to_load(
+  to_load = to_load,
+  raw_root = "../data",
+  corrected_marker_root = "../data/_Corrected Marker Files"
+)
+
+saveRDS(all$all_data, "../data/acc_all_data.rds")
+
+
+
+```
+We now have to correct the markers. Therefor we generate a table with the corrected markers
+
+
+
+
+```{r}
+# project-relative root
+root <- file.path("../data", "_Corrected Marker Files")
+
+# 1) find all marker txt files (marker*.txt only, safer than all .txt)
+marker_files <- list.files(
+  path = root,
+  pattern = "marker.*\\.txt$",
+  recursive = TRUE,
+  full.names = TRUE,
+  ignore.case = TRUE
+)
+
+# 2) parse identifiers from folder structure
+# supports:
+#   <Date>/<Session X>/<Sensor>/<markerfile>.txt
+#   <Date>/<Session X>/<markerfile>.txt
+parse_ids_from_path <- function(fp, root) {
+
+  rel <- gsub(
+    paste0("^", normalizePath(root, winslash = "/"), "/?"),
+    "",
+    normalizePath(fp, winslash = "/")
+  )
+
+  parts <- str_split(rel, "/", simplify = TRUE)
+
+  date_folder <- parts[1]
+
+  session_nr <- str_match(parts[2], "Session\\s*([0-9]+)")[, 2]
+  session_nr <- as.integer(session_nr)
+
+  # if there is a sensor folder, it is usually parts[3] and numeric; otherwise infer from filename
+  sensor_chr <- NA_character_
+  if (ncol(parts) >= 3 && str_detect(parts[3], "^\\d{4,}$")) {
+    sensor_chr <- parts[3]
+  } else {
+    # try to extract last 4 digits from filename (works for many of your files)
+    sensor_chr <- str_extract(basename(fp), "\\d{4}(?=__|_)")
+    if (is.na(sensor_chr)) sensor_chr <- str_extract(basename(fp), "\\d{4}$")
+  }
+
+  tibble(
+    date_folder = date_folder,
+    session_nr  = session_nr,
+    sensor_chr  = sensor_chr,
+    key         = paste(date_folder, session_nr, sensor_chr, sep = "|"),
+    source_file = fp
+  )
+}
+
+# 3) extract timestamp–marker pairs
+extract_markers <- function(fp) {
+
+  txt <- paste(readLines(fp, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
+
+  # allow digits in marker names too (e.g., BASELINE1), still supports underscores
+  m <- str_match_all(txt, "(\\d{9,13})\\s*,\\s*([A-Z0-9_]+)")[[1]]
+
+  if (nrow(m) == 0) return(tibble(timestamp = numeric(), marker = character()))
+
+  tibble(
+    # keep numeric to avoid integer overflow risk; you can convert later
+    timestamp = as.numeric(m[, 2]),
+    marker    = m[, 3]
+  )
+}
+
+# 4) build final tibble
+markers_df <- map_dfr(marker_files, function(fp) {
+
+  ids <- parse_ids_from_path(fp, root)
+  mk  <- extract_markers(fp)
+
+  if (nrow(mk) == 0) return(tibble())
+
+  bind_cols(ids[rep(1, nrow(mk)), ], mk)
+})
+
+
+# add ECG_ParticpantID column
+markers_df <- markers_df %>%
+  mutate(
+    date_folder = str_replace_all(date_folder, "\\s+", ""),
+    key = paste(date_folder, session_nr, sensor_chr, sep = "|")
+  ) %>%
+  left_join(master_lookup, by = "key")
+
+# result
+markers_df
+
+# write next to your other data outputs (since script is in scripts/)
+write.csv(markers_df, file = file.path("../data", "markers_corrected.csv"), row.names = FALSE)
+
+# sanity check
+nrow(markers_df)
+count(markers_df, marker, sort = TRUE) %>% head(20)
+sum(is.na(markers_df$sensor_chr))
+
+```
+ Because the datasets are really big, at this point we connect it to a database. that will allow us to only load the data necessary which will save RAM
+ 
+
+ 
+```{r}
+#read in acc all data.rds
+acc_all_data <- readRDS("../data/acc_all_data.rds")
+
+con <- dbConnect(duckdb::duckdb(), dbdir = "../data/imu.duckdb")  
+
+
+dbWriteTable(con, name = "markers_db", value = markers_df, overwrite = TRUE)
+dbWriteTable(con, name = "masterdata_db", value = masterdata, overwrite = TRUE)
+dbWriteTable(con, name = "acc_all_data_db", value = acc_all_data, overwrite = TRUE)
+
+markers_db   <- tbl(con, "markers_db")
+masterdata_db <- tbl(con, "masterdata_db")
+acc_all_data_db <- tbl(con, "acc_all_data_db")
+
+dbListTables(con)
+```
+
+As we only focus on the playtime/concert time we will now filter the data to only include the data between these markers.
+
+```{r}
+# 1) Build per-participant marker windows
+marker_windows <- markers_db %>%
+  mutate(
+    timestamp = as.numeric(timestamp),
+    timestamp = if_else(timestamp >= 1e12, timestamp / 1000.0, timestamp)
+  ) %>%
+  summarise(
+    rec_start     = sql("min(CASE WHEN marker = 'RECORDING_START' THEN timestamp END)"),
+    play_start    = sql("min(CASE WHEN marker = 'PLAYTIME_START' THEN timestamp END)"),
+    play_stop     = sql("min(CASE WHEN marker = 'PLAYTIME_STOP' THEN timestamp END)"),
+    concert_start = sql("min(CASE WHEN marker = 'CONCERT_START' THEN timestamp END)"),
+    concert_stop  = sql("min(CASE WHEN marker = 'CONCERT_STOP' THEN timestamp END)"),
+    .by = ECG_ParticipantID
+  )
+
+# 2) Attach condition (WITHOUT renaming the table)
+windows_tbl2 <- masterdata_db %>%
+  select(ECG_ParticipantID, Condition_Physio) %>%
+  left_join(marker_windows, by = "ECG_ParticipantID") %>%
+  mutate(
+    start_epoch = case_when(
+      Condition_Physio == "Playtime" ~ play_start,
+      Condition_Physio == "Concert"  ~ concert_start,
+      TRUE ~ NA_real_
+    ),
+    stop_epoch = case_when(
+      Condition_Physio == "Playtime" ~ play_stop,
+      Condition_Physio == "Concert"  ~ concert_stop,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(ECG_ParticipantID, Condition_Physio, rec_start, start_epoch, stop_epoch)
+
+# 3) Filter IMU data
+acc_in_window <- acc_all_data_db %>%
+  inner_join(windows_tbl2, by = "ECG_ParticipantID") %>%
+  dplyr::filter(!is.na(rec_start), !is.na(start_epoch), !is.na(stop_epoch)) %>%
+  dplyr::mutate(imu_epoch = rec_start + (timestamp_ms / 1000)) %>%
+  dplyr::filter(imu_epoch >= start_epoch, imu_epoch <= stop_epoch)
+
+# results
+acc_in_window %>% summarise(n = n()) %>% collect()
+
+acc_in_window %>%
+  summarise(n = n(), .by = Condition_Physio) %>%
+  collect()
+
+# drop acc_all_data from R to free RAM
+rm(acc_all_data)
+gc()
+#save acc_in_window in db and as rds
+acc_in_window <- acc_in_window %>% collect()
+saveRDS(acc_in_window, "../data/acc_data_in_window.rds")
+
+
+
+# load acc_in_window from rds
+acc_in_window <- readRDS("../data/acc_data_in_window.rds")
+
+# write to db
+dbWriteTable(con, name = "acc_data_in_window_db", value = acc_in_window, overwrite = TRUE)
+acc_data_in_window_db <- tbl(con, "acc_data_in_window_db")
+
+# check out tables in database
+dbListTables(con)
+
+```
+Perfect, everything is set for the analysis now!

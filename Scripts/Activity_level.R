@@ -1,103 +1,153 @@
-library(dplyr)
+# ------------------------------------------------------------
+# Libraries
+# ------------------------------------------------------------
+library(DBI)
+library(duckdb)
+library(tidyverse)
 library(dbplyr)
-
-# 1) Per-row movement table
-dbExecute(con, "DROP TABLE IF EXISTS acc_movement")
-
-acc_movement <- tbl(con, "acc_data_clean") %>%
-  group_by(key) %>%  # IMPORTANT: group BEFORE lag()
-  mutate(
-    dfx = fx - lag(fx, order_by = timestamp_ms),
-    dfy = fy - lag(fy, order_by = timestamp_ms),
-    dfz = fz - lag(fz, order_by = timestamp_ms),
-    movement = sqrt(dfx*dfx + dfy*dfy + dfz*dfz)
-  ) %>%
-  ungroup() %>%
-  compute(name = "acc_movement", temporary = FALSE)
-
-# 2) Per-key summary table (mean + median)
-dbExecute(con, "DROP TABLE IF EXISTS acc_movement_summary")
-
-acc_movement_summary <- tbl(con, "acc_movement") %>%
-  filter(!is.na(movement)) %>%   # drop first sample per key
-  group_by(key) %>%
-  summarise(
-    mean_movement   = mean(movement),
-    median_movement = sql("median(movement)"),
-    n_samples       = n(),
-    .groups = "drop"
-  ) %>%
-  compute(name = "acc_movement_summary", temporary = FALSE)
-
-# 3) Join with metadata
-movement_tbl <- tbl(con, "acc_movement_summary")
-meta_tbl     <- tbl(con, "metadata")
-
-movement_meta <- movement_tbl %>%
-  left_join(meta_tbl, by = c("key" = "valid_key"))
-
-# 4) Descriptives by condition
-desc_condition <- movement_meta %>%
-  group_by(condition) %>%
-  summarise(
-    n = n(),
-    mean_mean_movement   = mean(mean_movement),
-    sd_mean_movement     = sd(mean_movement),
-    median_mean_movement = sql("median(mean_movement)"),
-    mean_median_movement = mean(median_movement),
-    .groups = "drop"
-  ) %>%
-  collect()
-
-desc_condition
-
-
-# Descriptives by participant
-desc_participant <- movement_meta %>%
-  group_by(participant) %>%
-  summarise(
-    n = n(),
-    mean_mean_movement = mean(mean_movement),
-    sd_mean_movement   = sd(mean_movement),
-    .groups = "drop"
-  ) %>%
-  collect()
-
-desc_participant
-
-# t-tests
-analysis_df <- movement_meta %>%
-  select(participant, condition, mean_movement, median_movement) %>%
-  collect()
-
-t_condition   <- t.test(mean_movement ~ condition, data = analysis_df)
-t_participant <- t.test(mean_movement ~ participant, data = analysis_df)
-
-t_condition
-t_participant
-
-# effect sizes
 library(effectsize)
+library(signal)
 
-# Condition effect
-d_condition <- cohens_d(mean_movement ~ condition, data = analysis_df)
-d_condition
+# ------------------------------------------------------------
+# 0) Connect + reference DB tables
+# ------------------------------------------------------------
+con <- dbConnect(duckdb::duckdb(), dbdir = "./data/imu.duckdb") 
 
-# Participant effect
-d_participant <- cohens_d(mean_movement ~ participant, data = analysis_df)
-d_participant
+dbListTables(con)
+acc_data_in_window_db <- tbl(con, "acc_data_in_window_db")
+masterdata_db         <- tbl(con, "masterdata_db")
 
-# percent difference between conditions
-means_by_condition <- analysis_df %>%
-  group_by(condition) %>%
-  summarise(mean_movement = mean(mean_movement))
+# ------------------------------------------------------------
+# 1) Create LOW-PASS filtered acceleration table (DB-backed)
+#    - Filtering is done in R (filtfilt)
+#    - Never filter across ECG_ParticipantID boundaries
+# ------------------------------------------------------------
+fs <- 208
+cutoff <- 10
+nyq <- 0.5 * fs
+bf <- butter(4, cutoff / nyq, type = "low")
 
-means_by_condition
+df_lp <- acc_data_in_window_db %>%
+  select(ECG_ParticipantID, timestamp_ms, x, y, z) %>%
+  arrange(ECG_ParticipantID, timestamp_ms) %>%
+  collect()
 
-m1 <- means_by_condition$mean_movement[1]
-m2 <- means_by_condition$mean_movement[2]
+df_lp <- df_lp %>%
+  group_by(ECG_ParticipantID) %>%
+  mutate(
+    lx = filtfilt(bf, x),
+    ly = filtfilt(bf, y),
+    lz = filtfilt(bf, z)
+  ) %>%
+  ungroup()
 
-percent_diff <- (m2 - m1) / m1 * 100
-percent_diff
+DBI::dbExecute(con, "DROP TABLE IF EXISTS acc_data_in_window_lp_db")
+DBI::dbWriteTable(
+  con,
+  name = "acc_data_in_window_lp_db",
+  value = df_lp,
+  overwrite = TRUE
+)
 
+# ------------------------------------------------------------
+# 2) Movement pipeline (raw / filtered / low-pass)
+#    - Fully DB-backed except for filtering
+# ------------------------------------------------------------
+run_movement_pipeline <- function(signal = c("filtered", "raw", "lowpass")) {
+  signal <- match.arg(signal)
+  
+  if (signal == "filtered") {
+    src_tbl <- "acc_data_in_window_db"
+    ax <- "fx"; ay <- "fy"; az <- "fz"
+    suffix <- "fxyz"
+  } else if (signal == "raw") {
+    src_tbl <- "acc_data_in_window_db"
+    ax <- "x"; ay <- "y"; az <- "z"
+    suffix <- "xyz"
+  } else {  # lowpass
+    src_tbl <- "acc_data_in_window_lp_db"
+    ax <- "lx"; ay <- "ly"; az <- "lz"
+    suffix <- "lxyz"
+  }
+  
+  movement_table <- paste0("acc_movement_", suffix, "_db")
+  summary_table  <- paste0("acc_movement_summary_", suffix, "_db")
+  
+  # ----------------------------------------------------------
+  # 2.1 Per-row movement (Euclidean norm of successive diffs)
+  # ----------------------------------------------------------
+  DBI::dbExecute(con, sprintf("DROP TABLE IF EXISTS %s", movement_table))
+  
+  tbl(con, src_tbl) %>%
+    group_by(ECG_ParticipantID) %>%
+    mutate(
+      d1 = !!sym(ax) - lag(!!sym(ax), order_by = timestamp_ms),
+      d2 = !!sym(ay) - lag(!!sym(ay), order_by = timestamp_ms),
+      d3 = !!sym(az) - lag(!!sym(az), order_by = timestamp_ms),
+      movement = sqrt(d1*d1 + d2*d2 + d3*d3)
+    ) %>%
+    ungroup() %>%
+    compute(name = movement_table, temporary = FALSE)
+  
+  # ----------------------------------------------------------
+  # 2.2 Per-participant summary
+  # ----------------------------------------------------------
+  DBI::dbExecute(con, sprintf("DROP TABLE IF EXISTS %s", summary_table))
+  
+  tbl(con, movement_table) %>%
+    dplyr::filter(!is.na(movement)) %>%
+    group_by(ECG_ParticipantID) %>%
+    dplyr::summarise(
+      mean_movement   = mean(movement),
+      median_movement = sql("median(movement)"),
+      n_samples       = n(),
+      .groups = "drop"
+    ) %>%
+    compute(name = summary_table, temporary = FALSE)
+  
+  # ----------------------------------------------------------
+  # 2.3 Join MASTERDATA + child-only
+  # ----------------------------------------------------------
+  movement_child_db <- tbl(con, summary_table) %>%
+    left_join(
+      masterdata_db %>%
+        select(ECG_ParticipantID, ParticipantType, Condition_Physio) %>%
+        distinct(),
+      by = "ECG_ParticipantID"
+    ) %>%
+    dplyr::filter(ParticipantType == "Child")
+  
+  
+  
+  analysis_df <- movement_child_db %>%
+    select(Condition_Physio, mean_movement) %>%
+    collect()
+  
+  list(
+    desc = movement_child_db %>%
+      group_by(Condition_Physio) %>%
+      dplyr::summarise(
+        n_ids = n(),
+        mean_movement = mean(mean_movement),
+        sd_movement   = sd(mean_movement),
+        .groups = "drop"
+      ) %>%
+      collect(),
+    
+    t_test = t.test(mean_movement ~ Condition_Physio, data = analysis_df),
+    d      = cohens_d(mean_movement ~ Condition_Physio, data = analysis_df),
+    
+    analysis_df = analysis_df
+  )
+}
 
+# ------------------------------------------------------------
+# 3) Run all signal variants
+# ------------------------------------------------------------
+res_fxyz <- run_movement_pipeline("filtered")  # fx / fy / fz
+res_xyz  <- run_movement_pipeline("raw")       # x  / y  / z
+res_lxyz <- run_movement_pipeline("lowpass")   # lx / ly / lz
+
+res_fxyz$desc; res_fxyz$t_test; res_fxyz$d
+res_xyz$desc;  res_xyz$t_test;  res_xyz$d
+res_lxyz$desc; res_lxyz$t_test; res_lxyz$d
