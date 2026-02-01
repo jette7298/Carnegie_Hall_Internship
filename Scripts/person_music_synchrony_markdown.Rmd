@@ -1,0 +1,2322 @@
+---
+title: "Person-Music Synchrony"
+author: "Miguel Martin Hidalgo"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This file explains how the Person–Music synchrony analysis was conducted. If you have any questions or would like to discuss the analysis, you’re very welcome to email me at mfhidalgo18@hotmail.com!
+
+## What to expect from this file
+Per concert session:
+- A plot showing the differences and similarities in movement and audio energy.
+- Cross-correlations; a computation that calculates how strong movement and audio energy are related. Two cross-correlations analyses are done:
+  1. Cross-correlations over all data within sessions.
+  2. Cross-correlations over data within sessions that exceeds an energy threshold; to capture      the parts where there is the most rhythm.
+     -> These correlations will be visualized in a plot below
+
+## Data Preparation
+
+For every concert session, an analysis of both the audio and movement data has been done. Before results can be derived, some data preparation had to be done. The data preparation for the audio and movement are similar, but have some difference. These will be described below.
+
+-> AUDIO DATA
+1. Load in the data. The most important information that the data gives is the amplitude (loudness) per sample and sample rate (amount of samples per second)
+2. Determine Unix timestamps; to match with movement data
+3. Compute mean amplitude per 10 ms; loudness over a longer time period.
+4. Compute changes in volume between mean amplitudes; to capture changes in energy. This is done to detect rhythm.
+5. Derive positive changes in volume; rising energy tells where the rhythm is.
+6. Calculate and scale rolling averages; clean up data.
+
+-> MOVEMENT DATA
+1. Load in the data.
+2. Match Unix timestamps with the audio data.
+3. Select relevant day, session and sensors.
+4. Compute mean movement per 10ms (using fx, fy & fz).
+5. Compute changes between mean movement; to capture changes in energy.
+6. Derive positive changes in volume.
+7. Calculate and scale rolling averages.
+
+## Libraries
+
+These libraries were used to do the analysis. 
+
+```{r, message = FALSE}
+library(tidyverse)
+library(zoo)
+library(tuneR)
+library(seewave)
+library(pracma)
+library(plotly)
+library(DescTools)
+
+```
+
+## Loading in the movement data
+
+When loading in data, it is important to put the right path within the brackets that match the files. This chunk contains the code to import the movement dataset. The audio data will be loaded in per session below. 
+
+```{r}
+# Movement
+data = readRDS("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/acc_all_data_subjectpath_splitted.rds")
+
+```
+
+## April 2 - Session 1
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+# Load audio data
+audio_april2_s1 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/April 2_session 1_1743602784.wav")
+
+```
+
+```{r}
+
+###
+### AUDIO DATA
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_april2_s1@samp.rate
+samples = audio_april2_s1@left 
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute positive changes (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 15, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+options(digits = 10)
+april2 = data |>
+  filter(date == "April 2")
+
+# Time start movement data -> 1743602251(508) -> 13:57:31
+# Time start audio data    -> 1743602784      -> 14:06:24
+# Time end audio data      -> 1743604294000   -> Audio is 1510 seconds long
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+# Get timestamps that match with the audio
+april2_s1 = april2 |>
+  filter(session == "Session 1",
+         time_utc_ms >= 1743602784000 & time_utc_ms <= 1743604294000) 
+
+# Calculate 10ms, seconds & minutes
+april2_s1 = april2_s1 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(april2_s1$x) + abs(april2_s1$y) + abs(april2_s1$z)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = april2_s1 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 15, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+
+```
+
+```{r}
+
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 11 more samples. Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:150999]
+
+# Cross correlations over all data
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 10]
+
+idx = which(audio_onset_envelope_scaled >= 10)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# We see a correlation of 0.456 at lag -28, energy >= 10
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 192
+# SE = 0.057
+
+```
+
+## April 2 - Session 2
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+audio_april2_s2 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/April 2_session 2_1743608115.wav")
+
+```
+
+```{r}
+###
+### AUDIO DATA
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_april2_s2@samp.rate
+samples = audio_april2_s2@left 
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means of movement
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 15, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+options(digits = 10)
+april2 = data |>
+  filter(date == "April 2")
+
+# Time start audio data    -> 1743608115000      -> 14:06:24
+# Time end audio data      -> 1743609886000   -> Audio is 1510 seconds long
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+# Get timestamps that match with the audio
+april2_s2 = april2 |>
+  filter(session == "Session 2",
+         time_utc_ms >= 1743608115000 & time_utc_ms <= 1743609886000) 
+
+# Calculate 10ms, seconds & minutes
+april2_s2 = april2_s2 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(april2_s2$fx) + abs(april2_s2$fy) + abs(april2_s2$fz)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = april2_s2 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means of movement
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 15, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+```
+
+```{r}
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 18 more samples. Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:177099]
+
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 5]
+
+idx = which(audio_onset_envelope_scaled >= 5)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# We see a correlation of 0.268 at lag 11, energy >= 5
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 1950
+# SE = 0.02
+
+```
+
+## April 4 - Session 1
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+audio_april4_s1 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/April 4_session 1_1743775479.wav")
+```
+
+```{r}
+###
+### AUDIO DATA
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_april4_s1@samp.rate
+samples = audio_april4_s1@left 
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 15, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+options(digits = 10)
+april4 = data |>
+  filter(date == "April 4")
+
+# Time start audio data    -> 1743775479000   
+# Time end audio data      -> 1743777278000
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+# Get timestamps that match with the audio
+april4_s1 = april4 |>
+  filter(session == "Session 1",
+         time_utc_ms >= 1743775479000 & time_utc_ms <= 1743777278000) 
+
+# Calculate 10ms, seconds & minutes
+april4_s1 = april4_s1 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(april4_s1$fx) + abs(april4_s1$fy) + abs(april4_s1$fz)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = april4_s1 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 15, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+```
+
+```{r}
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 1271 more samples (which is really odd?). Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:178654]
+
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 1500 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 10]
+
+idx = which(audio_onset_envelope_scaled >= 10)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# We see a correlation of 0.488 at lag 114, energy >= 10
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 240
+# SE = 0.049
+```
+
+## April 4 - Session 2
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+audio_april4_s2 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/April 4_session 2_1743780780.wav")
+```
+
+```{r}
+###
+### AUDIO DATA
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_april4_s2@samp.rate
+samples = audio_april4_s2@left 
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 15, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+options(digits = 10)
+april4 = data |>
+  filter(date == "April 4")
+
+# Time start audio data    -> 1743780780000  
+# Time end audio data      -> 
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+# Get timestamps that match with the audio
+april4_s2 = april4 |>
+  filter(session == "Session 2",
+         time_utc_ms >= 1743780780000 & time_utc_ms <= 1743782543000) 
+
+# Calculate 10ms, seconds & minutes
+april4_s2 = april4_s2 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(april4_s2$fx) + abs(april4_s2$fy) + abs(april4_s2$fz)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = april4_s2 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 15, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+```
+
+```{r}
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 12 more samples. Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:176299]
+
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 100 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 8]
+
+idx = which(audio_onset_envelope_scaled >= 8)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 100 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# We see a correlation of 0.362 at lag -80, energy > 8
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 516
+# SE = 0.038
+
+```
+
+## November 4 - Session 1
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+audio_november4_s1 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/November 4_session 1_1762268753.wav")
+```
+
+```{r}
+###
+### AUDIO DATA  
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_november4_s1@samp.rate
+samples = audio_november4_s1@left 
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 5, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+# November 4 data
+options(digits = 10)
+november4 = data |>
+  filter(date == "November 4")
+
+# Time start movement data -> 1762267108926   -> 14:38:28 GMT
+# Time end movement data   -> 1762276386441   -> 17:13:06 GMT
+# Time start audio data    -> 1762268753000   -> 15:05:53 GMT
+# Time end audio data      -> 1762270685000   -> 15:38:05 GMT
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+#   Get timestamps that match with the audio
+november4_s1 = november4 |>
+  filter(session == "Session 1",
+         time_utc_ms >= 1762268753000 & time_utc_ms <= 1762270685000) 
+
+# Calculate 10ms, seconds & minutes
+november4_s1 = november4_s1 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(november4_s1$fx) + abs(november4_s1$fy) + abs(november4_s1$fz)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = november4_s1 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 5, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 25
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 25
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+```
+
+```{r}
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 95 more samples. Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:193199]
+
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 5]
+
+idx = which(audio_onset_envelope_scaled >= 0.2)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# We see a correlation of 0.433 at lag 55, energy >= 0.2
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 2956
+# SE = 0.015
+
+```
+
+## November 4 - Session 2
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+audio_november4_s2 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/November 4_session 2_1762274319.wav")
+
+```
+
+```{r}
+###
+### AUDIO DATA  
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_november4_s2@samp.rate
+samples = audio_november4_s2@left 
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 5, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+# November 4 data
+options(digits = 10)
+november4 = data |>
+  filter(date == "November 4")
+
+# Time start audio data    -> 1762274319000
+# Time end audio data      -> 1762276269000
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+#   Get timestamps that match with the audio
+november4_s2 = november4 |>
+  filter(session == "Session 2",
+         time_utc_ms >= 1762274319000 & time_utc_ms <= 1762276269000) 
+
+# Calculate 10ms, seconds & minutes
+november4_s2 = november4_s2 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms, na.rm = TRUE),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(november4_s2$fx) + abs(november4_s2$fy) + abs(november4_s2$fz)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = november4_s2 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 5, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 10
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 25
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+```
+
+```{r}
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 80 more samples. Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:194999]
+
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 1]
+
+idx = which(audio_onset_envelope_scaled >= 0.2)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 300 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+print(cc_table)
+
+# We see a correlation of 0.312 at lag -213, energy >= 0.2
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 2814
+# SE = 0.017
+```
+
+## November 6 - Session 1
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+audio_november6_s1 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/November 6_session 1_1762441622.wav")
+```
+
+```{r}
+###
+### AUDIO DATA  
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_november6_s1@samp.rate
+samples = audio_november6_s1@left 
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 5, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+# November 6 data
+options(digits = 10)
+november6 = data |>
+  filter(date == "November 6")
+
+# Time start audio data    -> 1762441622000   
+# Time end audio data      -> 1762443557000  
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+#   Get timestamps that match with the audio
+november6_s1 = november6 |>
+  filter(session == "Session 1",
+         time_utc_ms >= 1762441622000 & time_utc_ms <= 1762443557000
+  ) 
+
+# Calculate 10ms, seconds & minutes
+november6_s1 = november6_s1 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(november6_s1$fx) + abs(november6_s1$fy) + abs(november6_s1$fz)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = november6_s1 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 5, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 25
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 25
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+
+```
+
+```{r}
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 75 more samples. Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:193499]
+
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 5]
+
+idx = which(audio_onset_envelope_scaled >= 5)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# We see a correlation of 0.445 at lag -186, energy >= 5
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 369
+# SE = 0.042
+
+```
+
+## November 6 - Session 2
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+audio_november6_s2 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/November 6_session 2_1762447472.wav")
+```
+
+```{r}
+###
+### AUDIO DATA  
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_november6_s2@samp.rate
+samples = audio_november6_s2@left 
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 5, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+# November 6 data
+options(digits = 10)
+november6 = data |>
+  filter(date == "November 6")
+
+# Time start audio data    -> 1762447472000   
+# Time end audio data      -> 1762449394000 
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+#   Get timestamps that match with the audio
+november6_s2 = november6 |>
+  filter(session == "Session 2",
+         time_utc_ms >= 1762447472000 & time_utc_ms <= 1762449394000
+  ) 
+
+# Calculate 10ms, seconds & minutes
+november6_s2 = november6_s2 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(november6_s2$fx) + abs(november6_s2$fy) + abs(november6_s2$fz)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = november6_s2 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 5, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+```
+
+```{r}
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 62 more samples. Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:192199]
+
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 0.01]
+
+idx = which(audio_onset_envelope_scaled >= 0.01)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# We see a correlation of 0.224 at lag -105, energy >= 0.01
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 8562
+# SE = 0.01
+```
+
+## November 8 - Session 1
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+audio_november8_s1 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/November 8_session 1_1762614358.wav")
+```
+
+```{r}
+###
+### AUDIO DATA  
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_november8_s1@samp.rate
+samples = audio_november8_s1@left 
+
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 5, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+# November 8 data
+options(digits = 10)
+november8 = data |>
+  filter(date == "November 8")
+
+# Time start audio data    -> 1762614358000   
+# Time end audio data      -> 1762616244000 
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+#   Get timestamps that match with the audio
+november8_s1 = november8 |>
+  filter(session == "Session 1",
+         time_utc_ms >= 1762614358000 & time_utc_ms <= 1762616244000
+  ) 
+
+# Calculate 10ms, seconds & minutes
+november8_s1 = november8_s1 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(november8_s1$fx) + abs(november8_s1$fy) + abs(november8_s1$fz)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = november8_s1 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 5, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 30
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 30
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+```
+
+```{r}
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 88 more samples. Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:188599]
+
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 5]
+
+idx = which(audio_onset_envelope_scaled >= 5)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# We see a correlation of 0.319 at lag -156, energy >= 5
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 216
+# SE = 0.061
+```
+
+## November 8 - Session 2
+
+```{r}
+# Remove earlier code to clean up environment
+rm(list = setdiff(ls(), "data"))
+
+audio_november8_s2 = readWave("C:/Users/mfhid/OneDrive/Documenten/Carnegie_Hall_Internship/November 8_session 2_1762619813.wav")
+```
+
+```{r}
+###
+### AUDIO DATA  
+###
+
+# Extract samples, sample rate & number of seconds
+samplerate = audio_november8_s2@samp.rate
+samples = audio_november8_s2@left 
+
+n_seconds = floor(length(samples) / samplerate)  # aantal seconden
+n_10ms = round(0.01 * samplerate)
+
+# Make data frame with audio data
+audio_data = data.frame(
+  sample_id = seq_along(samples),
+  samples = samples
+)
+
+# Add 10ms column that counts every time 10 ms passes
+#   After every 480 samples, 10 ms passes
+audio_10ms = audio_data |>
+  mutate(ten_ms = floor((seq_len(nrow(audio_data)) - 1) / n_10ms)) |>
+  group_by(ten_ms) |>
+  summarise(mean_audio_10ms = mean(samples), .groups = "drop")
+
+# Compute changes between means
+dx_audio = diff(audio_10ms$mean_audio_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_audio_hw = pmax(dx_audio, 0)
+
+# Compute energy (to strengthen big transients)
+dx_audio_energy = dx_audio_hw^2
+
+# Compute rolling averages of the energy
+audio_onset_envelope = rollmean(dx_audio_energy, k = 5, fill = NA, align = "center")
+
+# Scale rolling averages
+audio_onset_envelope_scaled = (audio_onset_envelope - mean(audio_onset_envelope, na.rm = TRUE)) / sd(audio_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_audio_onset_env = data.frame(
+  energy = dx_audio_energy,
+  onset_envelope = audio_onset_envelope,
+  onset_envelope_scaled = audio_onset_envelope_scaled,
+  ms = seq_along(dx_audio_energy),
+  min = seq_along(dx_audio_energy) / 100 / 60
+)
+
+ggplot(df_audio_onset_env, aes(x = min, y = onset_envelope_scaled)) +
+  geom_line() +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Onset Envelope (Mean Amount of Rising Energy) per 10 ms, scaled to Minutes",
+       subtitle = "Audio Data - November 6 - Session 2",
+       x = "Minute",
+       y = "Energy"
+  )
+```
+
+```{r}
+###
+### MOVEMENT DATA
+###
+
+# November 8 data
+options(digits = 10)
+november8 = data |>
+  filter(date == "November 8")
+
+# Time start audio data    -> 1762619813000
+# Time end audio data      -> 1762621682000 
+# Time_utc_ms steps        -> 4.807617188     -> around 4.8 ms per xyz sample 
+
+#   Get timestamps that match with the audio
+november8_s2 = november8 |>
+  filter(session == "Session 2",
+         time_utc_ms >= 1762619813000 & time_utc_ms <= 1762621682000
+  ) 
+
+# Calculate 10ms, seconds & minutes
+november8_s2 = november8_s2 |>
+  group_by(sensor) |>
+  mutate(
+    t0 = min(time_utc_ms),
+    relative_time_ms = time_utc_ms - t0,
+    ten_ms = floor(relative_time_ms / 10),
+    second = floor(relative_time_ms / 1000),
+    minute = floor(relative_time_ms / 60000) 
+  ) |>
+  ungroup()
+
+# Compute mean movement (use absolute values as we are interested in movement amount, not direction)
+mean_move = (abs(november8_s2$fx) + abs(november8_s2$fy) + abs(november8_s2$fz)) / 3 
+
+# Compute mean movement per 10 ms (since timestamp step is 4.8 (not 5), widths are sometimes 2 and sometimes 3)
+move_10ms = november8_s2 |>
+  mutate(ten_ms = ten_ms,
+         mean_move = mean_move) |>
+  group_by(ten_ms) |>
+  summarise(
+    mean_move_10ms = mean(mean_move, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Compute changes between means
+dx_move = diff(move_10ms$mean_move_10ms)
+
+# Compute half-waves (we only want the parts where energy rises, parts where energy drops cancels rising parts out)
+dx_move_hw = pmax(dx_move, 0)
+
+# Compute energy (to strengthen big transients)
+dx_move_energy = dx_move_hw^2
+
+# Compute rolling averages of the energy
+move_onset_envelope = rollmean(dx_move_energy, k = 5, fill = NA, align = "center")
+
+# Apply scaling 
+move_onset_envelope_scaled = (move_onset_envelope - mean(move_onset_envelope, na.rm = TRUE)) / sd(move_onset_envelope, na.rm = TRUE)
+
+# Make data frame with energy and rolling average of energy
+df_move_onset_env = data.frame(
+  energy = dx_move_energy,
+  onset_envelope = move_onset_envelope,
+  onset_envelope_scaled = move_onset_envelope_scaled,
+  ms = seq_along(dx_move_energy),
+  min = seq_along(dx_move_energy) / 100 / 60
+)
+```
+
+```{r}
+###
+### FINAL PLOT
+###
+
+# Convert outliers to NA's
+df_audio_onset_env$onset_envelope_scaled[
+  df_audio_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_move_onset_env$onset_envelope_scaled[
+  df_move_onset_env$onset_envelope_scaled > 20
+] = NA
+
+df_audio_onset_env$Signal = "Audio"
+df_move_onset_env$Signal = "Movement"
+
+p = ggplot() +
+  scale_color_manual(
+    values = c(
+      "Audio" = "#2596be",
+      "Movement" = "black"
+    )
+  ) +
+  geom_line(data = df_audio_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  geom_line(data = df_move_onset_env, aes(x = min, y = onset_envelope_scaled, color = Signal)) +
+  scale_x_continuous(
+    breaks = seq(0, max(df_audio_onset_env$min), by = 1)  # elke 1 seconde
+  ) +
+  theme_bw() +
+  labs(title = "Movement vs Audio - Onset Envelope - Scaled to Minutes - November 4 - Session 1",
+       x = "Minute",
+       y = "Energy",
+       color = "Signal"
+  )
+
+ggplotly(p)
+```
+
+```{r}
+###
+### CROSS-CORRELATIONS
+###
+
+# Remove NA's that originate from the rolling averages
+df_audio_onset_env$onset_envelope_scaled = audio_onset_envelope_scaled
+df_move_onset_env$onset_envelope_scaled = move_onset_envelope_scaled
+
+move_onset_envelope_scaled[is.na(move_onset_envelope_scaled)] = 0
+audio_onset_envelope_scaled[is.na(audio_onset_envelope_scaled)] = 0
+
+# Audio onset has 99 more samples. Let's correct that.
+audio_onset_envelope_scaled = audio_onset_envelope_scaled[1:186899]
+
+crosscor = ccf(audio_onset_envelope_scaled, 
+               move_onset_envelope_scaled,
+               lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor$acf,
+                  Lag = crosscor$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# Let's try filtering (in both audio/movement data) at moments where there is the most rhythm (highest energy in audio)
+audio_onset_envelope_filtered = audio_onset_envelope_scaled[audio_onset_envelope_scaled >= 2]
+
+idx = which(audio_onset_envelope_scaled >= 2)
+move_onset_envelope_filtered = move_onset_envelope_scaled[idx]
+
+options(scipen = 999)
+
+crosscor_filtered = ccf(audio_onset_envelope_filtered, 
+                        move_onset_envelope_filtered,
+                        lag.max = 200 # Correct for sample differences between audio/movement and movement-following-music differences
+)
+cc_table = tibble(Correlation = crosscor_filtered$acf,
+                  Lag = crosscor_filtered$lag) |>
+  arrange(desc(Correlation))
+head(cc_table)
+
+# We see a correlation of 0.241 at lag -143, energy >= 2
+
+N = length(idx)
+r = cc_table$Correlation[1]
+SE = (1 - r^2) / (sqrt(N - 2))
+
+# N = 456
+# SE = 0.044
+```
+## Correlations Plot & Dataframe
+```{r}
+df_cor = data.frame('DateSession' = c("April 2 - Session 1",
+                                         "April 2 - Session 2",
+                                         "April 4 - Session 1",
+                                         "April 4 - Session 2",
+                                         "November 4 - Session 1",
+                                         "November 4 - Session 2",
+                                         "November 6 - Session 1",
+                                         "November 6 - Session 2",
+                                         "November 8 - Session 1",
+                                         "November 8 - Session 2"
+                                         ),
+                    'CrossCorrelation' = c(0.456, 0.268, 0.488, 0.362, 0.433,
+                                            0.312, 0.445, 0.224, 0.319, 0.241),
+                    'Lag' = c(-28, 11, 114, -80, 55, -213, -186, -105, -156, -143),
+                    'SE' = c(0.057, 0.02, 0.049, 0.038, 0.015, 0.017, 0.042, 0.01, 0.061, 0.044),
+                    'N_of_samples' = c(192, 1950, 240, 516, 2956, 2814, 369, 8562, 216, 456),
+                    'Energy_Threshold' = c(">= 10", ">= 5", ">= 10", ">= 8", ">= 0.2",
+                                           ">= 0.2", ">= 5", ">= 0.01", ">= 5", ">= 2")
+                    )
+
+df_cor$DateSession <- factor(df_cor$DateSession, 
+                             levels = df_cor$DateSession[order(df_cor$CrossCorrelation, decreasing = TRUE)])
+
+ggplot(df_cor, aes(x = DateSession, y = CrossCorrelation)) +
+  geom_col(fill = "#2596be", color = "black") +              
+  geom_errorbar(aes(ymin = CrossCorrelation - SE, ymax = CrossCorrelation + SE),
+                       width = 0.5, color = "darkorange", size = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Movement vs Audio - Cross Correlation per Session",
+    x = NULL,
+    y = "Cross Correlation (r)"
+  )
+
+```
