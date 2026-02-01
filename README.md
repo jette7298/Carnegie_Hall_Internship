@@ -1,6 +1,6 @@
 # Carnegie_Hall_Internship
 
-The scripts folder contains different R-Scripts to read in the data and run different analysis,  specifically
+The scripts folder contains different R-Scripts to read in the data and run different analysis, specifically
 
 1. Load_Data_Complete.Rmd
 → contains a detailed explanation on how we read in the data into R, which cleaning procedures we followed and how to connect it to a database
@@ -19,6 +19,17 @@ The scripts folder contains different R-Scripts to read in the data and run diff
 → These participant-level activity summaries are joined with masterdata_db to attach Condition_Physio and ParticipantType, filtered to children where needed, and used for basic between-condition comparisons (e.g., Concert vs. Playtime) and accompanying visual checks.
 
 4. Creating Dataset for Person-Person Synchrony.R
-5. Person-Person Synchrony Ideas.R
-6. T tests.R
-   
+→ prepares the data to perform analysis on synchrony between persons   
+
+5. Person-Person Synchrony Measures.R
+→ code and explanation to the different synchrony measures
+
+6. T-tests synchrony data.R
+→   consists of loading the data, doing the t-tests and a short explanation of the finding for the synchrony between persons   
+
+7. splitting_subjectpath.R
+→ prepares the dataset for the Person-Music Synchrony analysis
+
+8. person_music_synchrony_markdown.Rmd
+→ code and explanation to the Person-Music Synchrony analysis    
+
